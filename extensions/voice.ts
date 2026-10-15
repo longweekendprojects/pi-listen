@@ -231,11 +231,52 @@ interface AudioCaptureTool { name: string; cmd: string; args: string[]; }
 
 // Try available audio capture tools in order of preference
 let _cachedAudioTool: AudioCaptureTool | null | undefined;
+let selectedMicrophone: string | undefined;
+
+/** Pick the input device for future recordings; undefined means system default. */
+function setMicrophone(name: string | undefined): void {
+	selectedMicrophone = name || undefined;
+	_cachedAudioTool = undefined;
+}
+
+/** List input device names the capture tools can open. */
+function listMicrophones(): string[] {
+	try {
+		if (process.platform === "darwin" && commandExists("ffmpeg")) {
+			const r = spawnSync("ffmpeg", ["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""], { encoding: "utf8", timeout: 5000 });
+			const out = (r.stderr || "").split("AVFoundation audio devices:")[1] || "";
+			return [...out.matchAll(/\]\s\[\d+\]\s(.+)$/gm)].map(m => m[1]!.trim());
+		}
+		if (process.platform === "darwin") {
+			const r = spawnSync("system_profiler", ["SPAudioDataType", "-json"], { encoding: "utf8", timeout: 10000 });
+			const items = JSON.parse(r.stdout || "{}").SPAudioDataType?.[0]?._items || [];
+			return items.filter((d: any) => d.coreaudio_device_input).map((d: any) => d._name);
+		}
+		if (process.platform === "linux" && commandExists("pactl")) {
+			const r = spawnSync("pactl", ["list", "short", "sources"], { encoding: "utf8", timeout: 5000 });
+			return (r.stdout || "").split("\n").map(l => l.split("\t")[1]).filter((n): n is string => !!n && !n.endsWith(".monitor"));
+		}
+	} catch {}
+	return [];
+}
+
 function detectAudioCaptureTool(): AudioCaptureTool | null {
 	if (_cachedAudioTool !== undefined) return _cachedAudioTool;
+	const mic = selectedMicrophone;
+	const soxDriver = process.platform === "darwin" ? "coreaudio" : process.platform === "linux" ? "pulseaudio" : null;
+
+	// SoX with a named device: `sox -t <driver> <device>` instead of `rec`.
+	if (mic && soxDriver && commandExists("sox")) {
+		_cachedAudioTool = {
+			name: "sox",
+			cmd: "sox",
+			args: ["-q", "--buffer", "4096", "-t", soxDriver, mic, "-c", String(CHANNELS), "-b", "16", "-e", "signed-integer", "-t", "raw", "-", "rate", String(SAMPLE_RATE)],
+		};
+		return _cachedAudioTool;
+	}
 
 	// 1. SoX rec — purpose-built for recording, best quality
-	if (commandExists("rec")) {
+	if (!mic && commandExists("rec")) {
 		_cachedAudioTool = {
 			name: "sox",
 			cmd: "rec",
@@ -261,9 +302,9 @@ function detectAudioCaptureTool(): AudioCaptureTool | null {
 		// Input device varies by platform
 		let inputArgs: string[];
 		if (isMac) {
-			inputArgs = ["-f", "avfoundation", "-i", ":default"];
+			inputArgs = ["-f", "avfoundation", "-i", `:${mic || "default"}`];
 		} else if (isLinux) {
-			inputArgs = ["-f", "pulse", "-i", "default"];
+			inputArgs = ["-f", "pulse", "-i", mic || "default"];
 		} else if (isWin) {
 			// DirectShow has no "default" alias — enumerate devices and pick the first audio device
 			const dshowDevice = detectWindowsAudioDevice();
@@ -2142,6 +2183,7 @@ export default function (pi: ExtensionAPI) {
 		currentCwd = startCtx.cwd;
 		const loaded = loadConfigWithSource(startCtx.cwd);
 		config = loaded.config;
+		setMicrophone(config.microphone);
 		configSource = loaded.source;
 
 		// v7.1.3 — version banner emitted to debug log on every session
@@ -3256,6 +3298,35 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// v7.1.3 — tune the hold-to-talk activation delay.
+	pi.registerCommand("voice-mic", {
+		description: "Choose the microphone: /voice-mic, /voice-mic <name>, or /voice-mic default",
+		handler: async (args, cmdCtx) => {
+			ctx = cmdCtx;
+			const devices = listMicrophones();
+			let choice = (args || "").trim();
+			if (!choice) {
+				const current = config.microphone || "System default";
+				if (devices.length === 0) {
+					cmdCtx.ui.notify(`Microphone: ${current}. No devices found; pass a name with /voice-mic <name>.`, "info");
+					return;
+				}
+				const picked = await cmdCtx.ui.select(`Microphone (current: ${current})`, ["System default", ...devices]);
+				if (!picked) return;
+				choice = picked;
+			}
+			let name: string | undefined;
+			if (!/^(default|system default)$/i.test(choice)) {
+				name = devices.find(d => d.toLowerCase() === choice.toLowerCase())
+					|| devices.find(d => d.toLowerCase().includes(choice.toLowerCase()))
+					|| choice;
+			}
+			config.microphone = name;
+			setMicrophone(name);
+			saveConfig(config, config.scope === "project" ? "project" : "global", currentCwd);
+			cmdCtx.ui.notify(`Microphone set to ${name || "system default"}.`, "info");
+		},
+	});
+
 	pi.registerCommand("voice-hold-delay", {
 		description: "Set hold-to-talk delay in ms (200-3000, default 700)",
 		handler: async (args, cmdCtx) => {

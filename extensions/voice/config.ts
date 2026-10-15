@@ -39,6 +39,8 @@ export interface VoiceConfig {
 	localEndpoint?: string;
 	/** Global-only shortcut used to toggle recording without hold-to-talk */
 	toggleShortcut?: string;
+	/** Input device name; unset means the system default microphone. */
+	microphone?: string;
 
 	// ─── TTS (text-to-speech) ─────────────────────────────────────────
 	// All TTS fields are opt-in (default: TTS disabled). New in v6.0.0.
@@ -220,6 +222,7 @@ function migrateConfig(rawVoice: any, source: VoiceConfigSource): VoiceConfig {
 		autoSubmitOnSpeak: typeof rawVoice.autoSubmitOnSpeak === "boolean"
 			? rawVoice.autoSubmitOnSpeak
 			: DEFAULT_CONFIG.autoSubmitOnSpeak,
+		microphone: typeof rawVoice.microphone === "string" && rawVoice.microphone ? rawVoice.microphone : undefined,
 		holdThresholdMs: typeof rawVoice.holdThresholdMs === "number"
 			&& Number.isFinite(rawVoice.holdThresholdMs)
 			&& rawVoice.holdThresholdMs >= 200
