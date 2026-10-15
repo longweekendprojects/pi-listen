@@ -260,6 +260,31 @@ function listMicrophones(): string[] {
 	return [];
 }
 
+const liveRecorders = new Set<ChildProcess>();
+let recorderExitHookInstalled = false;
+
+/**
+ * Start the capture process. A hard deadline and an exit hook make sure a
+ * recorder never outlives its recording or the Pi process.
+ */
+function spawnRecorder(tool: AudioCaptureTool): ChildProcess {
+	const proc = spawn(tool.cmd, tool.args, { stdio: ["pipe", "pipe", "pipe"] });
+	liveRecorders.add(proc);
+	const deadline = setTimeout(() => {
+		voiceDebug("recorder exceeded hard deadline → killing", { pid: proc.pid });
+		try { proc.kill("SIGKILL"); } catch {}
+	}, (MAX_RECORDING_SECS + 30) * 1000);
+	deadline.unref?.();
+	proc.once("exit", () => { clearTimeout(deadline); liveRecorders.delete(proc); });
+	if (!recorderExitHookInstalled) {
+		recorderExitHookInstalled = true;
+		process.once("exit", () => {
+			for (const p of liveRecorders) { try { p.kill("SIGKILL"); } catch {} }
+		});
+	}
+	return proc;
+}
+
 function detectAudioCaptureTool(): AudioCaptureTool | null {
 	if (_cachedAudioTool !== undefined) return _cachedAudioTool;
 	const mic = selectedMicrophone;
@@ -399,7 +424,7 @@ function startStreamingSession(
 	}
 	voiceDebug("Using audio capture tool:", audioTool.name);
 
-	const recProc = spawn(audioTool.cmd, audioTool.args, { stdio: ["pipe", "pipe", "pipe"] });
+	const recProc = spawnRecorder(audioTool);
 
 	recProc.stderr?.on("data", (d: Buffer) => {
 		const msg = d.toString().trim();
@@ -1437,7 +1462,7 @@ export default function (pi: ExtensionAPI) {
 				setVoiceState("idle");
 				return false;
 			}
-			const recProc = spawn(audioTool.cmd, audioTool.args, { stdio: ["pipe", "pipe", "pipe"] });
+			const recProc = spawnRecorder(audioTool);
 			recProc.stderr?.on("data", (d: Buffer) => {
 				const msg = d.toString().trim();
 				if (msg.includes("buffer overrun") || msg.includes("Discarding") || msg.includes("Last message repeated")) return;
