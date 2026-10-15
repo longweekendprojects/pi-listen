@@ -232,11 +232,15 @@ interface AudioCaptureTool { name: string; cmd: string; args: string[]; }
 // Try available audio capture tools in order of preference
 let _cachedAudioTool: AudioCaptureTool | null | undefined;
 let selectedMicrophone: string | undefined;
+let _micCheckedAt = 0;
+let _micPresent = true;
 
 /** Pick the input device for future recordings; undefined means system default. */
 function setMicrophone(name: string | undefined): void {
 	selectedMicrophone = name || undefined;
 	_cachedAudioTool = undefined;
+	_micCheckedAt = 0;
+	_micPresent = true;
 }
 
 /** List input device names the capture tools can open. */
@@ -286,8 +290,17 @@ function spawnRecorder(tool: AudioCaptureTool): ChildProcess {
 }
 
 function detectAudioCaptureTool(): AudioCaptureTool | null {
+	// A named microphone can disappear (unplugged, lid closed). Re-check it
+	// at most every 15s and fall back to the system default when it is gone.
+	if (selectedMicrophone && Date.now() - _micCheckedAt > 15_000) {
+		_micCheckedAt = Date.now();
+		const devices = listMicrophones();
+		const present = devices.length === 0 || devices.includes(selectedMicrophone);
+		if (present !== _micPresent) { _micPresent = present; _cachedAudioTool = undefined; }
+		if (!present) voiceDebug("selected microphone missing → using system default", { selectedMicrophone, devices });
+	}
 	if (_cachedAudioTool !== undefined) return _cachedAudioTool;
-	const mic = selectedMicrophone;
+	const mic = selectedMicrophone && _micPresent ? selectedMicrophone : undefined;
 	const soxDriver = process.platform === "darwin" ? "coreaudio" : process.platform === "linux" ? "pulseaudio" : null;
 
 	// SoX with a named device: `sox -t <driver> <device>` instead of `rec`.
