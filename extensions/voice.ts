@@ -432,7 +432,7 @@ function startStreamingSession(
 		recProc.stdout?.on("data", (chunk: Buffer) => {
 			if (ws.readyState === WebSocket.OPEN) {
 				session.hadAudioData = true;
-				try { ws.send(chunk); } catch {}
+				try { ws.send(new Uint8Array(chunk)); } catch {}
 				// Feed audio data to level meter for reactive waveform
 				updateAudioLevel(chunk);
 				// Start stale-session watchdog on first audio chunk
@@ -1402,7 +1402,7 @@ export default function (pi: ExtensionAPI) {
 				if (msg.includes("buffer overrun") || msg.includes("Discarding") || msg.includes("Last message repeated")) return;
 				voiceDebug(`${audioTool.name} stderr:`, msg);
 			});
-			session = startLocalSession(recProc, recordingCallbacks);
+			session = startLocalSession(recProc, recordingCallbacks, config);
 
 			// Feed audio level meter for waveform animation
 			recProc.stdout?.on("data", (chunk: Buffer) => {
