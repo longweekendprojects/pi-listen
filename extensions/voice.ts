@@ -1638,6 +1638,14 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	/** Type a space where the cursor is, not at the end of the input. */
+	function typeSpaceAtCursor(): void {
+		if (!ctx?.hasUI) return;
+		const ui = ctx.ui as typeof ctx.ui & { pasteToEditor?: (text: string) => void };
+		if (typeof ui.pasteToEditor === "function") ui.pasteToEditor(" ");
+		else ui.setEditorText((ui.getEditorText() || "") + " ");
+	}
+
 	function setupHoldToTalk() {
 		if (!ctx?.hasUI) return;
 
@@ -1679,9 +1687,9 @@ export default function (pi: ExtensionAPI) {
 			// don't let space holds activate voice — they're just typing.
 			if (!matchesKey(data, "space") && !isKeyRelease(data) && !isKeyRepeat(data)) {
 				// Regular keypress that isn't space — user is typing
-				if (data.length > 0 && data.charCodeAt(0) >= 32) {
-					lastNonSpaceKeyTime = Date.now();
-				}
+				// Includes escape sequences: arrow keys and kitty-encoded keys
+				// mean the user is editing, so a following space is typing.
+				if (data.length > 0) lastNonSpaceKeyTime = Date.now();
 			}
 
 			// ── SPACE handling ──
@@ -1728,13 +1736,9 @@ export default function (pi: ExtensionAPI) {
 						clearWarmupWidget();
 						hideWidget();
 						setVoiceState("idle");
-						if (holdDuration < 300) {
-							// Quick tap — just type a space
-							if (ctx?.hasUI) ctx.ui.setEditorText((ctx.ui.getEditorText() || "") + " ");
-						} else {
-							// Held long enough to see warmup but let go → show hint
-							ctx?.ui.notify("Hold SPACE longer to activate voice.", "info");
-						}
+						// Released before recording started — it was a typed space.
+						voiceDebug("space released during warmup", { holdDuration });
+						typeSpaceAtCursor();
 						return { consume: true };
 					}
 
@@ -1742,7 +1746,7 @@ export default function (pi: ExtensionAPI) {
 					// Kitty path since we enter warmup on first press, but handle anyway)
 					if (spaceDownTime && !holdConfirmed && voiceState === "idle") {
 						resetHoldState();
-						if (ctx?.hasUI) ctx.ui.setEditorText((ctx.ui.getEditorText() || "") + " ");
+						typeSpaceAtCursor();
 						return { consume: true };
 					}
 
@@ -2059,7 +2063,10 @@ export default function (pi: ExtensionAPI) {
 				clearWarmupWidget();
 				hideWidget();
 				resetHoldState();
+				abortPreRecording();
 				setVoiceState("idle");
+				// Kitty path consumed the space on press; give it back before this key.
+				if (kittyReleaseDetected) typeSpaceAtCursor();
 				return undefined;
 			}
 
