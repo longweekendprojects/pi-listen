@@ -43,11 +43,11 @@ export const LANGUAGES: LangEntry[] = [
 	{ name: "Korean", code: "ko", popular: true },
 	{ name: "Arabic", code: "ar", popular: true },
 	{ name: "Russian", code: "ru", popular: true },
-	// Nova-2 only (auto-switches model — shown in picker)
-	{ name: "Chinese — Mandarin [Nova-2]", code: "zh", popular: true, model: "nova-2" },
-	{ name: "Chinese — Mandarin Simplified [Nova-2]", code: "zh-CN", model: "nova-2" },
-	{ name: "Chinese — Mandarin Traditional [Nova-2]", code: "zh-TW", model: "nova-2" },
-	{ name: "Chinese — Cantonese [Nova-2]", code: "zh-HK", model: "nova-2" },
+	// Chinese (Nova-3 since 2026)
+	{ name: "Chinese — Mandarin", code: "zh", popular: true },
+	{ name: "Chinese — Mandarin Simplified", code: "zh-CN" },
+	{ name: "Chinese — Mandarin Traditional", code: "zh-TW" },
+	{ name: "Chinese — Cantonese", code: "zh-HK" },
 	// All others alphabetically (Nova-3)
 	{ name: "Belarusian", code: "be" },
 	{ name: "Bengali", code: "bn" },
@@ -104,7 +104,7 @@ function formatLangOption(l: LangEntry): string {
 	return `${l.name} (${l.code})`;
 }
 
-/** Get the best model for a language code. Nova-2 for Chinese, Nova-3 for everything else. */
+/** Get the best model for a language code. Nova-3 covers every listed language. */
 export function modelForLanguage(code: string): string {
 	const entry = LANGUAGES.find(l => l.code === code);
 	return entry?.model || "nova-3";
