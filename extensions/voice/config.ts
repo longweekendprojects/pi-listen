@@ -26,6 +26,8 @@ export type VoiceBackend = "deepgram" | "local";
 export interface VoiceConfig {
 	version: number;
 	enabled: boolean;
+	/** Turn voice on when a new session starts. Default false: sessions start with voice off. */
+	startEnabled?: boolean;
 	language: string;
 	scope: VoiceSettingsScope;
 	onboarding: VoiceOnboardingState;
@@ -190,6 +192,7 @@ function migrateConfig(rawVoice: any, source: VoiceConfigSource): VoiceConfig {
 	return {
 		version: VOICE_CONFIG_VERSION,
 		enabled: typeof rawVoice.enabled === "boolean" ? rawVoice.enabled : DEFAULT_CONFIG.enabled,
+		startEnabled: rawVoice.startEnabled === true,
 		language: typeof rawVoice.language === "string" ? rawVoice.language : DEFAULT_CONFIG.language,
 		scope: (rawVoice.scope as VoiceSettingsScope | undefined) ?? (source === "project" ? "project" : "global"),
 		deepgramApiKey: typeof rawVoice.deepgramApiKey === "string" ? rawVoice.deepgramApiKey : undefined,

@@ -2226,9 +2226,15 @@ export default function (pi: ExtensionAPI) {
 
 		ctx = startCtx;
 		currentCwd = startCtx.cwd;
+		const wasEnabled = (globalThis as any).__piListenVoiceEnabled === true;
 		const loaded = loadConfigWithSource(startCtx.cwd);
 		config = loaded.config;
 		setMicrophone(config.microphone);
+		// New sessions start with voice off unless startEnabled is set.
+		// Resume, fork and reload keep whatever /voice last chose.
+		config.enabled = (reason === "startup" || reason === "new")
+			? config.startEnabled === true
+			: wasEnabled;
 		configSource = loaded.source;
 
 		// v7.1.3 — version banner emitted to debug log on every session
@@ -2317,6 +2323,8 @@ export default function (pi: ExtensionAPI) {
 		// versions whose replacement path may not await. The try/catch is so a
 		// throw inside voiceCleanup (e.g. a child process kill EPERM under load)
 		// can't leak ctx or skip the recognizer cache clear.
+		// Remember on/off across /reload, resume and fork (the module is re-imported on reload).
+		(globalThis as any).__piListenVoiceEnabled = config.enabled;
 		try { voiceCleanup(); } catch (err) {
 			voiceDebug("voiceCleanup threw during shutdown", { error: String(err) });
 		}
