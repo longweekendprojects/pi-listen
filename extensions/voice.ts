@@ -432,7 +432,7 @@ function startStreamingSession(
 		recProc.stdout?.on("data", (chunk: Buffer) => {
 			if (ws.readyState === WebSocket.OPEN) {
 				session.hadAudioData = true;
-				try { ws.send(new Uint8Array(chunk)); } catch {}
+				try { ws.send(chunk); } catch {}
 				// Feed audio data to level meter for reactive waveform
 				updateAudioLevel(chunk);
 				// Start stale-session watchdog on first audio chunk
@@ -479,17 +479,6 @@ function startStreamingSession(
 					session.interimText = transcript;
 				}
 
-				session.onTranscript(session.interimText, session.finalizedParts);
-			} else if (msg.type === "TurnInfo") {
-				// Flux (/v2/listen): transcript covers the whole current turn.
-				const transcript = (msg.transcript || "").trim();
-				if (transcript) session.hadSpeech = true;
-				if (msg.event === "EndOfTurn") {
-					if (transcript) session.finalizedParts.push(transcript);
-					session.interimText = "";
-				} else {
-					session.interimText = transcript;
-				}
 				session.onTranscript(session.interimText, session.finalizedParts);
 			} else if (msg.type === "Error" || msg.type === "error") {
 				failStreamingSession(session, msg.message || msg.description || "Deepgram error");
