@@ -90,6 +90,16 @@ import {
 	getLanguagesForLocalModel, isLanguageSupportedByModel, localLanguageDisplayName,
 	type LocalSession,
 } from "./voice/local";
+import { shouldArmReleaseDetectOnRepeat, decideRecordingStartTimer } from "./voice/hold-to-talk";
+import { GapTimer, type TimerPort } from "./voice/release-controller";
+
+/** Adapter for the real event loop — lets GapTimer run under the real setTimeout. */
+const realTimerPort: TimerPort = {
+	once(fn, ms) {
+		const id = setTimeout(fn, ms);
+		return { cancel: () => clearTimeout(id) };
+	},
+};
 
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -221,11 +231,90 @@ interface AudioCaptureTool { name: string; cmd: string; args: string[]; }
 
 // Try available audio capture tools in order of preference
 let _cachedAudioTool: AudioCaptureTool | null | undefined;
+let selectedMicrophone: string | undefined;
+let _micCheckedAt = 0;
+let _micPresent = true;
+
+/** Pick the input device for future recordings; undefined means system default. */
+function setMicrophone(name: string | undefined): void {
+	selectedMicrophone = name || undefined;
+	_cachedAudioTool = undefined;
+	_micCheckedAt = 0;
+	_micPresent = true;
+}
+
+/** List input device names the capture tools can open. */
+function listMicrophones(): string[] {
+	try {
+		if (process.platform === "darwin" && commandExists("ffmpeg")) {
+			const r = spawnSync("ffmpeg", ["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""], { encoding: "utf8", timeout: 5000 });
+			const out = (r.stderr || "").split("AVFoundation audio devices:")[1] || "";
+			return [...out.matchAll(/\]\s\[\d+\]\s(.+)$/gm)].map(m => m[1]!.trim());
+		}
+		if (process.platform === "darwin") {
+			const r = spawnSync("system_profiler", ["SPAudioDataType", "-json"], { encoding: "utf8", timeout: 10000 });
+			const items = JSON.parse(r.stdout || "{}").SPAudioDataType?.[0]?._items || [];
+			return items.filter((d: any) => d.coreaudio_device_input).map((d: any) => d._name);
+		}
+		if (process.platform === "linux" && commandExists("pactl")) {
+			const r = spawnSync("pactl", ["list", "short", "sources"], { encoding: "utf8", timeout: 5000 });
+			return (r.stdout || "").split("\n").map(l => l.split("\t")[1]).filter((n): n is string => !!n && !n.endsWith(".monitor"));
+		}
+	} catch {}
+	return [];
+}
+
+const liveRecorders = new Set<ChildProcess>();
+let recorderExitHookInstalled = false;
+
+/**
+ * Start the capture process. A hard deadline and an exit hook make sure a
+ * recorder never outlives its recording or the Pi process.
+ */
+function spawnRecorder(tool: AudioCaptureTool): ChildProcess {
+	const proc = spawn(tool.cmd, tool.args, { stdio: ["pipe", "pipe", "pipe"] });
+	liveRecorders.add(proc);
+	const deadline = setTimeout(() => {
+		voiceDebug("recorder exceeded hard deadline → killing", { pid: proc.pid });
+		try { proc.kill("SIGKILL"); } catch {}
+	}, (MAX_RECORDING_SECS + 30) * 1000);
+	deadline.unref?.();
+	proc.once("exit", () => { clearTimeout(deadline); liveRecorders.delete(proc); });
+	if (!recorderExitHookInstalled) {
+		recorderExitHookInstalled = true;
+		process.once("exit", () => {
+			for (const p of liveRecorders) { try { p.kill("SIGKILL"); } catch {} }
+		});
+	}
+	return proc;
+}
+
 function detectAudioCaptureTool(): AudioCaptureTool | null {
+	// A named microphone can disappear (unplugged, lid closed). Re-check it
+	// at most every 15s and fall back to the system default when it is gone.
+	if (selectedMicrophone && Date.now() - _micCheckedAt > 15_000) {
+		_micCheckedAt = Date.now();
+		const devices = listMicrophones();
+		const present = devices.length === 0 || devices.includes(selectedMicrophone);
+		if (present !== _micPresent) { _micPresent = present; _cachedAudioTool = undefined; }
+		if (!present) voiceDebug("selected microphone missing → using system default", { selectedMicrophone, devices });
+	}
 	if (_cachedAudioTool !== undefined) return _cachedAudioTool;
+	const mic = selectedMicrophone && _micPresent ? selectedMicrophone : undefined;
+	const soxDriver = process.platform === "darwin" ? "coreaudio" : process.platform === "linux" ? "pulseaudio" : null;
+
+	// SoX with a named device: `sox -t <driver> <device>` instead of `rec`.
+	if (mic && soxDriver && commandExists("sox")) {
+		_cachedAudioTool = {
+			name: "sox",
+			cmd: "sox",
+			args: ["-q", "--buffer", "4096", "-t", soxDriver, mic, "-c", String(CHANNELS), "-b", "16", "-e", "signed-integer", "-t", "raw", "-", "rate", String(SAMPLE_RATE)],
+		};
+		return _cachedAudioTool;
+	}
 
 	// 1. SoX rec — purpose-built for recording, best quality
-	if (commandExists("rec")) {
+	if (!mic && commandExists("rec")) {
 		_cachedAudioTool = {
 			name: "sox",
 			cmd: "rec",
@@ -251,9 +340,9 @@ function detectAudioCaptureTool(): AudioCaptureTool | null {
 		// Input device varies by platform
 		let inputArgs: string[];
 		if (isMac) {
-			inputArgs = ["-f", "avfoundation", "-i", ":default"];
+			inputArgs = ["-f", "avfoundation", "-i", `:${mic || "default"}`];
 		} else if (isLinux) {
-			inputArgs = ["-f", "pulse", "-i", "default"];
+			inputArgs = ["-f", "pulse", "-i", mic || "default"];
 		} else if (isWin) {
 			// DirectShow has no "default" alias — enumerate devices and pick the first audio device
 			const dshowDevice = detectWindowsAudioDevice();
@@ -348,7 +437,7 @@ function startStreamingSession(
 	}
 	voiceDebug("Using audio capture tool:", audioTool.name);
 
-	const recProc = spawn(audioTool.cmd, audioTool.args, { stdio: ["pipe", "pipe", "pipe"] });
+	const recProc = spawnRecorder(audioTool);
 
 	recProc.stderr?.on("data", (d: Buffer) => {
 		const msg = d.toString().trim();
@@ -422,7 +511,7 @@ function startStreamingSession(
 		recProc.stdout?.on("data", (chunk: Buffer) => {
 			if (ws.readyState === WebSocket.OPEN) {
 				session.hadAudioData = true;
-				try { ws.send(chunk); } catch {}
+				try { ws.send(new Uint8Array(chunk)); } catch {}
 				// Feed audio data to level meter for reactive waveform
 				updateAudioLevel(chunk);
 				// Start stale-session watchdog on first audio chunk
@@ -690,7 +779,7 @@ export default function (pi: ExtensionAPI) {
 	let spaceDownTime: number | null = null;
 	let holdActivationTimer: ReturnType<typeof setTimeout> | null = null;
 	let spaceConsumed = false;        // True once threshold passed and recording started
-	let releaseDetectTimer: ReturnType<typeof setTimeout> | null = null;
+	let releaseGapTimer: GapTimer | null = null; // gap-based release detection (see release-controller.ts)
 	let warmupWidgetTimer: ReturnType<typeof setInterval> | null = null;
 	let spacePressCount = 0;          // Count of rapid space presses (for non-Kitty hold detection)
 	let lastSpacePressTime = 0;       // Timestamp of last space press event
@@ -800,10 +889,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function clearReleaseTimer() {
-		if (releaseDetectTimer) {
-			clearTimeout(releaseDetectTimer);
-			releaseDetectTimer = null;
-		}
+		releaseGapTimer?.cancel();
 	}
 
 	function clearWarmupWidget() {
@@ -1389,13 +1475,13 @@ export default function (pi: ExtensionAPI) {
 				setVoiceState("idle");
 				return false;
 			}
-			const recProc = spawn(audioTool.cmd, audioTool.args, { stdio: ["pipe", "pipe", "pipe"] });
+			const recProc = spawnRecorder(audioTool);
 			recProc.stderr?.on("data", (d: Buffer) => {
 				const msg = d.toString().trim();
 				if (msg.includes("buffer overrun") || msg.includes("Discarding") || msg.includes("Last message repeated")) return;
 				voiceDebug(`${audioTool.name} stderr:`, msg);
 			});
-			session = startLocalSession(recProc, recordingCallbacks);
+			session = startLocalSession(recProc, recordingCallbacks, config);
 
 			// Feed audio level meter for waveform animation
 			recProc.stdout?.on("data", (chunk: Buffer) => {
@@ -1439,6 +1525,17 @@ export default function (pi: ExtensionAPI) {
 
 		showRecordingWidget();
 		playSound("start");
+
+		// #13：录音就绪（voiceState 已切 recording、成功出口）才 arm gap-based
+		// release timer。仅 hold 会话（spaceDownTime 非 null，用户按住 SPACE）
+		// 且非 kitty 时 arm：按住由后续 repeat 持续 re-arm，松键（repeat 停止）
+		// 在 RELEASE_DETECT_RECORDING_MS 内被感知，启动窗口内松键也能 250ms 后停。
+		// toggle/dictation 无 repeat 流维持 timer，arm 会在约 250ms 后自动停掉
+		// 录音，故必须排除（即 spaceDownTime 为 null）。kitty 依赖真实
+		// key-release，同样 clear。
+		if (decideRecordingStartTimer({ kittyReleaseDetected, isHold: spaceDownTime != null }) === "arm") {
+			resetReleaseDetect();
+		}
 		return true;
 	}
 
@@ -1472,9 +1569,8 @@ export default function (pi: ExtensionAPI) {
 			clearRecordingAnimTimer();
 			hideWidget();
 			if (activeSession.backend === "local") {
-				// Local: show which model is transcribing + estimated time
-				const modelName = LOCAL_MODELS.find(m => m.id === (config.localModel || "whisper-small"))?.name || config.localModel || "local model";
-				ctx?.ui.notify(`Transcribing with ${modelName}…`, "info");
+				// The status bar shows "STT..." while finalizing. A notify() here
+				// stayed on screen after the transcript landed, so it is gone.
 				await stopLocalSession(activeSession, config);
 			} else {
 				stopStreamingSession(activeSession);
@@ -1516,7 +1612,7 @@ export default function (pi: ExtensionAPI) {
 	// from being mistaken for a key release (brief gap in events).
 
 	function onSpaceReleaseDetected() {
-		releaseDetectTimer = null;
+		// GapTimer has already self-cleared (single-shot); nothing to reset here.
 		voiceDebug("onSpaceReleaseDetected", { voiceState, holdConfirmed, spaceConsumed, spaceDownTime, spacePressCount, timeSinceRecStart: spaceConsumed ? Date.now() - recordingStartedAt : null });
 
 		// If we never confirmed this was a hold (< REPEAT_CONFIRM_COUNT rapid presses),
@@ -1574,8 +1670,17 @@ export default function (pi: ExtensionAPI) {
 				? RELEASE_DETECT_RECORDING_MS
 				: RELEASE_DETECT_MS;
 			voiceDebug("resetReleaseDetect", { timeout, voiceState, spaceConsumed });
-			releaseDetectTimer = setTimeout(onSpaceReleaseDetected, timeout);
+			releaseGapTimer = new GapTimer(realTimerPort, { ms: timeout, onFire: onSpaceReleaseDetected });
+			releaseGapTimer.arm();
 		}
+	}
+
+	/** Type a space where the cursor is, not at the end of the input. */
+	function typeSpaceAtCursor(): void {
+		if (!ctx?.hasUI) return;
+		const ui = ctx.ui as typeof ctx.ui & { pasteToEditor?: (text: string) => void };
+		if (typeof ui.pasteToEditor === "function") ui.pasteToEditor(" ");
+		else ui.setEditorText((ui.getEditorText() || "") + " ");
 	}
 
 	function setupHoldToTalk() {
@@ -1619,9 +1724,9 @@ export default function (pi: ExtensionAPI) {
 			// don't let space holds activate voice — they're just typing.
 			if (!matchesKey(data, "space") && !isKeyRelease(data) && !isKeyRepeat(data)) {
 				// Regular keypress that isn't space — user is typing
-				if (data.length > 0 && data.charCodeAt(0) >= 32) {
-					lastNonSpaceKeyTime = Date.now();
-				}
+				// Includes escape sequences: arrow keys and kitty-encoded keys
+				// mean the user is editing, so a following space is typing.
+				if (data.length > 0) lastNonSpaceKeyTime = Date.now();
 			}
 
 			// ── SPACE handling ──
@@ -1668,13 +1773,9 @@ export default function (pi: ExtensionAPI) {
 						clearWarmupWidget();
 						hideWidget();
 						setVoiceState("idle");
-						if (holdDuration < 300) {
-							// Quick tap — just type a space
-							if (ctx?.hasUI) ctx.ui.setEditorText((ctx.ui.getEditorText() || "") + " ");
-						} else {
-							// Held long enough to see warmup but let go → show hint
-							ctx?.ui.notify("Hold SPACE longer to activate voice.", "info");
-						}
+						// Released before recording started — it was a typed space.
+						voiceDebug("space released during warmup", { holdDuration });
+						typeSpaceAtCursor();
 						return { consume: true };
 					}
 
@@ -1682,7 +1783,7 @@ export default function (pi: ExtensionAPI) {
 					// Kitty path since we enter warmup on first press, but handle anyway)
 					if (spaceDownTime && !holdConfirmed && voiceState === "idle") {
 						resetHoldState();
-						if (ctx?.hasUI) ctx.ui.setEditorText((ctx.ui.getEditorText() || "") + " ");
+						typeSpaceAtCursor();
 						return { consume: true };
 					}
 
@@ -1702,7 +1803,15 @@ export default function (pi: ExtensionAPI) {
 
 				// ── Kitty key-repeat ──
 				if (isKeyRepeat(data)) {
-					// Already in recording/finalizing — just consume
+					// #13: terminals without key-release events (e.g. Ghostty on
+					// macOS, non-kitty modes) signal "released" purely by a GAP in
+					// repeat events. Every repeat must re-arm the release-detect
+					// timer — recording start clears it, and if nothing re-arms it
+					// the release is never detected → hold-to-talk locks up forever.
+					if (shouldArmReleaseDetectOnRepeat({ voiceState, kittyReleaseDetected })) {
+						resetReleaseDetect();
+					}
+					// Already in recording/finalizing — consume (release timer kept alive above)
 					if (voiceState === "recording" || voiceState === "finalizing" || spaceConsumed) {
 						return { consume: true };
 					}
@@ -1741,8 +1850,9 @@ export default function (pi: ExtensionAPI) {
 									// seamlessly replaces it using the same widget ID.
 									spaceConsumed = true;
 									recordingStartedAt = Date.now();
-									// Clear release timer during async recording startup
-									// to prevent false stop. Next repeat re-arms it.
+									// Clear release timer during async recording startup to
+									// prevent a false stop. The 250ms gap timer is re-armed
+									// once recording is actually ready — see startStreamingRecording (#13).
 									clearReleaseTimer();
 									voiceDebug("holdActivationTimer fired → starting recording (Kitty repeat path)");
 									startVoiceRecording().then((ok) => {
@@ -1766,7 +1876,8 @@ export default function (pi: ExtensionAPI) {
 
 						// Re-arm gap-based release detection — this is how
 						// Ghostty-on-macOS (repeats but no release) detects
-						// the key being released.
+						// the key being released. (Preserved from the original
+						// ordering — the recording-path re-arm above is separate.)
 						resetReleaseDetect();
 						return { consume: true };
 					}
@@ -1989,7 +2100,10 @@ export default function (pi: ExtensionAPI) {
 				clearWarmupWidget();
 				hideWidget();
 				resetHoldState();
+				abortPreRecording();
 				setVoiceState("idle");
+				// Kitty path consumed the space on press; give it back before this key.
+				if (kittyReleaseDetected) typeSpaceAtCursor();
 				return undefined;
 			}
 
@@ -2111,8 +2225,15 @@ export default function (pi: ExtensionAPI) {
 
 		ctx = startCtx;
 		currentCwd = startCtx.cwd;
+		const wasEnabled = (globalThis as any).__piListenVoiceEnabled === true;
 		const loaded = loadConfigWithSource(startCtx.cwd);
 		config = loaded.config;
+		setMicrophone(config.microphone);
+		// New sessions start with voice off unless startEnabled is set.
+		// Resume, fork and reload keep whatever /voice last chose.
+		config.enabled = (reason === "startup" || reason === "new")
+			? config.startEnabled === true
+			: wasEnabled;
 		configSource = loaded.source;
 
 		// v7.1.3 — version banner emitted to debug log on every session
@@ -2201,6 +2322,8 @@ export default function (pi: ExtensionAPI) {
 		// versions whose replacement path may not await. The try/catch is so a
 		// throw inside voiceCleanup (e.g. a child process kill EPERM under load)
 		// can't leak ctx or skip the recognizer cache clear.
+		// Remember on/off across /reload, resume and fork (the module is re-imported on reload).
+		(globalThis as any).__piListenVoiceEnabled = config.enabled;
 		try { voiceCleanup(); } catch (err) {
 			voiceDebug("voiceCleanup threw during shutdown", { error: String(err) });
 		}
@@ -3227,6 +3350,35 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// v7.1.3 — tune the hold-to-talk activation delay.
+	pi.registerCommand("voice-mic", {
+		description: "Choose the microphone: /voice-mic, /voice-mic <name>, or /voice-mic default",
+		handler: async (args, cmdCtx) => {
+			ctx = cmdCtx;
+			const devices = listMicrophones();
+			let choice = (args || "").trim();
+			if (!choice) {
+				const current = config.microphone || "System default";
+				if (devices.length === 0) {
+					cmdCtx.ui.notify(`Microphone: ${current}. No devices found; pass a name with /voice-mic <name>.`, "info");
+					return;
+				}
+				const picked = await cmdCtx.ui.select(`Microphone (current: ${current})`, ["System default", ...devices]);
+				if (!picked) return;
+				choice = picked;
+			}
+			let name: string | undefined;
+			if (!/^(default|system default)$/i.test(choice)) {
+				name = devices.find(d => d.toLowerCase() === choice.toLowerCase())
+					|| devices.find(d => d.toLowerCase().includes(choice.toLowerCase()))
+					|| choice;
+			}
+			config.microphone = name;
+			setMicrophone(name);
+			saveConfig(config, config.scope === "project" ? "project" : "global", currentCwd);
+			cmdCtx.ui.notify(`Microphone set to ${name || "system default"}.`, "info");
+		},
+	});
+
 	pi.registerCommand("voice-hold-delay", {
 		description: "Set hold-to-talk delay in ms (200-3000, default 700)",
 		handler: async (args, cmdCtx) => {

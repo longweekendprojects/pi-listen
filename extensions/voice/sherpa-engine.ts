@@ -88,6 +88,7 @@ export function clearRecognizerCache(): void {
 		// the call site to wire it up.
 		cachedRecognizer = null;
 	}
+	cachedOnline = null;
 }
 
 // ─── Transcription ───────────────────────────────────────────────────────────
@@ -271,6 +272,84 @@ function createTransducerRecognizer(model: LocalModelInfo, modelDir: string): Sh
 			// debug: 1 — uncomment to log per-stage (encoder/decoder/joiner) timings.
 		},
 	});
+}
+
+// ─── Streaming (online) recognition ──────────────────────────────────────────
+
+export interface StreamingDecoder {
+	/** Feed 16-bit PCM; returns new text when the transcript changed. */
+	accept(pcm: Buffer): { interim: string; finals: string[] } | null;
+	/** Flush remaining audio and return the full transcript. */
+	finish(): string;
+}
+
+let cachedOnline: { modelId: string; recognizer: SherpaRecognizer } | null = null;
+
+// Verified against sherpa-onnx-node 1.13.8 streaming-asr.js (OnlineRecognizer,
+// OnlineStream.setOption("language") for multilingual Nemotron models).
+export function createStreamingDecoder(model: LocalModelInfo, modelDir: string, language: string): StreamingDecoder {
+	const sherpa = getSherpaModule();
+	const files = model.sherpaModel.files;
+	if (!cachedOnline || cachedOnline.modelId !== model.id) {
+		cachedOnline = {
+			modelId: model.id,
+			recognizer: new sherpa.OnlineRecognizer({
+				featConfig: { sampleRate: 16000, featureDim: 80 },
+				modelConfig: {
+					transducer: {
+						encoder: path.join(modelDir, files.encoder!),
+						decoder: path.join(modelDir, files.decoder!),
+						joiner: path.join(modelDir, files.joiner!),
+					},
+					tokens: path.join(modelDir, files.tokens!),
+					numThreads: getNumThreads(TRANSDUCER_MAX_THREADS),
+					provider: "cpu",
+				},
+				decodingMethod: "greedy_search",
+				enableEndpoint: 1,
+				rule1MinTrailingSilence: 2.4,
+				rule2MinTrailingSilence: 1.2,
+				rule3MinUtteranceLength: 20,
+			}),
+		};
+	}
+	const recognizer = cachedOnline.recognizer;
+	const stream = recognizer.createStream();
+	const base = language.split("-")[0] || "auto";
+	if (model.langSupport !== "english-only" && typeof stream.setOption === "function") {
+		stream.setOption("language", base);
+	}
+	const finals: string[] = [];
+	let interim = "";
+
+	const drain = (): boolean => {
+		while (recognizer.isReady(stream)) recognizer.decode(stream);
+		let changed = false;
+		const text = (recognizer.getResult(stream)?.text || "").trim();
+		if (text !== interim) { interim = text; changed = true; }
+		if (recognizer.isEndpoint(stream)) {
+			if (interim) finals.push(interim);
+			interim = "";
+			recognizer.reset(stream);
+			changed = true;
+		}
+		return changed;
+	};
+
+	return {
+		accept(pcm) {
+			stream.acceptWaveform({ sampleRate: 16000, samples: pcmToFloat32(pcm) });
+			return drain() ? { interim, finals: [...finals] } : null;
+		},
+		finish() {
+			// Tail padding lets the model emit the last words of the chunk.
+			stream.acceptWaveform({ sampleRate: 16000, samples: new Float32Array(16000 * 0.8) });
+			stream.inputFinished();
+			drain();
+			if (interim) finals.push(interim);
+			return finals.join(" ").trim();
+		},
+	};
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
