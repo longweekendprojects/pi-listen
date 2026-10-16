@@ -1569,9 +1569,8 @@ export default function (pi: ExtensionAPI) {
 			clearRecordingAnimTimer();
 			hideWidget();
 			if (activeSession.backend === "local") {
-				// Local: show which model is transcribing + estimated time
-				const modelName = LOCAL_MODELS.find(m => m.id === (config.localModel || "whisper-small"))?.name || config.localModel || "local model";
-				ctx?.ui.notify(`Transcribing with ${modelName}…`, "info");
+				// The status bar shows "STT..." while finalizing. A notify() here
+				// stayed on screen after the transcript landed, so it is gone.
 				await stopLocalSession(activeSession, config);
 			} else {
 				stopStreamingSession(activeSession);
