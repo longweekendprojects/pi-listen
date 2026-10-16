@@ -64,6 +64,7 @@ import type {
 	ExtensionCommandContext,
 } from "@mariozechner/pi-coding-agent";
 import { isKeyRelease, isKeyRepeat, matchesKey, Key, type KeyId } from "@mariozechner/pi-tui";
+import { cleanupTranscript, ensureCleanupServer, stopCleanupServer, resolveCleanupModelPath, downloadDefaultCleanupModel, DEFAULT_CLEANUP_MODEL } from "./voice/cleanup";
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
@@ -1299,8 +1300,62 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	// ── Transcript cleanup with a local LLM ──
+	let cleanupAbort: AbortController | null = null;
+
+	function cancelCleanup() {
+		if (cleanupAbort) { cleanupAbort.abort(); cleanupAbort = null; }
+	}
+
+	/**
+	 * Stream a cleaned transcript into the editor, replacing the raw text.
+	 * Stops without changes if the user edits the editor meanwhile. The raw
+	 * text is kept so /voice-cleanup undo can restore it.
+	 */
+	function runCleanup(prefix: string, raw: string, done: (text: string) => void) {
+		cancelCleanup();
+		const ac = new AbortController();
+		cleanupAbort = ac;
+		const rawText = prefix + raw;
+		let shown = rawText;
+		const modelPath = resolveCleanupModelPath(config.cleanupModel);
+		ctx?.ui.setStatus("voice", "CLEANUP...");
+		cleanupTranscript(raw, modelPath, (soFar) => {
+			if (ac.signal.aborted || !ctx?.hasUI) return;
+			if ((ctx.ui.getEditorText() || "") !== shown) { voiceDebug("cleanup: editor changed → abort"); ac.abort(); return; }
+			shown = prefix + soFar;
+			ctx.ui.setEditorText(shown);
+		}, ac.signal).then((cleaned) => {
+			if (ac.signal.aborted) return;
+			if (cleaned === null) {
+				voiceDebug("cleanup rejected output → restoring raw");
+				if ((ctx?.ui.getEditorText() || "") === shown) ctx?.ui.setEditorText(rawText);
+				done(rawText);
+				return;
+			}
+			const finalText = prefix + cleaned;
+			if ((ctx?.ui.getEditorText() || "") === shown) ctx?.ui.setEditorText(finalText);
+			lastCleanup = { raw: rawText, cleaned: finalText };
+			done(finalText);
+		}).catch((err) => {
+			if (ac.signal.aborted) return;
+			voiceDebug("cleanup failed", { error: String(err) });
+			if ((ctx?.ui.getEditorText() || "") === shown) ctx?.ui.setEditorText(rawText);
+			ctx?.ui.notify(`Voice cleanup failed: ${String((err as Error)?.message || err)}. Kept the raw text.`, "warning");
+			done(rawText);
+		}).finally(() => {
+			if (cleanupAbort === ac) cleanupAbort = null;
+			updateVoiceStatus();
+		});
+	}
+	let lastCleanup: { raw: string; cleaned: string } | null = null;
+
 	async function startStreamingRecording(): Promise<boolean> {
 		voiceDebug("startStreamingRecording called", { hasKey: !!resolveDeepgramApiKey(config), hasPreRecording: !!preRecordingSession });
+		cancelCleanup();
+		if (config.cleanupEnabled === true) {
+			ensureCleanupServer(resolveCleanupModelPath(config.cleanupModel)).catch((err) => voiceDebug("cleanup prewarm failed", { error: String(err) }));
+		}
 		setVoiceState("recording");
 
 		// ── Callbacks for the active recording session ──
@@ -1359,6 +1414,7 @@ export default function (pi: ExtensionAPI) {
 					// agent immediately instead of sitting in the editor
 					// waiting for [enter]. Defaults OFF; user toggles via
 					// /voice-autosubmit or settings panel.
+					const submitIfEnabled = (finalText: string) => {
 					if (config.autoSubmitOnSpeak === true && finalText.trim().length > 0) {
 						// v7.2.3 — if the agent is currently mid-turn
 						// (especially mid-retry), DON'T auto-submit.
@@ -1372,7 +1428,7 @@ export default function (pi: ExtensionAPI) {
 						if (agentBusy) {
 							voiceDebug("autoSubmitOnSpeak: agent busy — leaving text in editor");
 							try {
-								ctx.ui.notify(
+								ctx?.ui.notify(
 									"Agent is busy — voice text held in editor. Press [↵] to send when ready.",
 									"info",
 								);
@@ -1428,13 +1484,19 @@ export default function (pi: ExtensionAPI) {
 							}
 						} else {
 							voiceDebug("autoSubmitOnSpeak: pi.sendUserMessage not available on this Pi version");
-							ctx.ui.notify(
+							ctx?.ui.notify(
 								"Auto-submit ON but unavailable on this Pi version (need pi.sendUserMessage). " +
 								"Press [enter] to send, or update Pi.",
 								"warning",
 							);
 						}
 						} // end else (agent not busy)
+					}
+					};
+					if (config.cleanupEnabled === true) {
+						runCleanup(prefix, fullText, submitIfEnabled);
+					} else {
+						submitIfEnabled(finalText);
 					}
 
 					const elapsed = ((Date.now() - recordingStart) / 1000).toFixed(1);
@@ -2324,6 +2386,7 @@ export default function (pi: ExtensionAPI) {
 		// can't leak ctx or skip the recognizer cache clear.
 		// Remember on/off across /reload, resume and fork (the module is re-imported on reload).
 		(globalThis as any).__piListenVoiceEnabled = config.enabled;
+		cancelCleanup();
 		try { voiceCleanup(); } catch (err) {
 			voiceDebug("voiceCleanup threw during shutdown", { error: String(err) });
 		}
@@ -3376,6 +3439,45 @@ export default function (pi: ExtensionAPI) {
 			setMicrophone(name);
 			saveConfig(config, config.scope === "project" ? "project" : "global", currentCwd);
 			cmdCtx.ui.notify(`Microphone set to ${name || "system default"}.`, "info");
+		},
+	});
+
+	pi.registerCommand("voice-cleanup", {
+		description: "Clean up dictation with a local LLM: /voice-cleanup [on|off|undo]",
+		handler: async (args, cmdCtx) => {
+			ctx = cmdCtx;
+			const sub = (args || "").trim().toLowerCase();
+			if (sub === "undo") {
+				if (lastCleanup && (cmdCtx.ui.getEditorText() || "") === lastCleanup.cleaned) {
+					cmdCtx.ui.setEditorText(lastCleanup.raw);
+					lastCleanup = null;
+				} else {
+					cmdCtx.ui.notify("Nothing to undo.", "info");
+				}
+				return;
+			}
+			const on = sub === "on" ? true : sub === "off" ? false : !(config.cleanupEnabled === true);
+			if (on) {
+				const modelPath = resolveCleanupModelPath(config.cleanupModel);
+				if (!config.cleanupModel && !fs.existsSync(modelPath)) {
+					cmdCtx.ui.notify(`Downloading ${DEFAULT_CLEANUP_MODEL.name} (${DEFAULT_CLEANUP_MODEL.size})…`, "info");
+					try {
+						await downloadDefaultCleanupModel((pct) => cmdCtx.ui.setStatus("voice", `CLEANUP DL ${pct}%`));
+					} catch (err) {
+						cmdCtx.ui.notify(`Download failed: ${String((err as Error)?.message || err)}`, "error");
+						updateVoiceStatus();
+						return;
+					}
+					updateVoiceStatus();
+				}
+				ensureCleanupServer(modelPath).catch((err) => cmdCtx.ui.notify(`Cleanup model failed to start: ${String((err as Error)?.message || err)}`, "error"));
+			} else {
+				cancelCleanup();
+				stopCleanupServer();
+			}
+			config.cleanupEnabled = on;
+			saveConfig(config, config.scope === "project" ? "project" : "global", currentCwd);
+			cmdCtx.ui.notify(`Voice cleanup ${on ? "on" : "off"}.${on ? " Use /voice-cleanup undo to restore the raw text." : ""}`, "info");
 		},
 	});
 
