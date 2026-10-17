@@ -38,8 +38,12 @@ export function resolveCleanupModelPath(configured?: string): string {
 	return path.join(CLEANUP_MODEL_DIR, DEFAULT_CLEANUP_MODEL.file);
 }
 
-let server: { proc: ChildProcess; port: number; model: string; ready: Promise<void> } | null = null;
-let exitHookInstalled = false;
+type ServerState = { proc: ChildProcess; port: number; model: string; ready: Promise<void> } | null;
+// Kept on globalThis so /reload reuses the loaded model instead of loading a second copy.
+const G = globalThis as any;
+let server: ServerState = G.__piListenCleanupServer ?? null;
+function setServer(v: ServerState) { server = v; G.__piListenCleanupServer = v; }
+let exitHookInstalled = !!G.__piListenCleanupExitHook;
 
 function freePort(): Promise<number> {
 	return new Promise((resolve, reject) => {
@@ -64,10 +68,16 @@ export async function ensureCleanupServer(modelPath: string): Promise<number> {
 	const proc = spawn("llama-server", [
 		"-m", modelPath, "--host", "127.0.0.1", "--port", String(port),
 		"-ngl", "99", "-c", "4096", "--jinja", "--reasoning-budget", "0",
+		// Few CPU threads and one slot: the GPU does the work, and the
+		// terminal and speech model keep their CPU time.
+		"-t", "2", "-tb", "2", "--parallel", "1",
 	], { stdio: "ignore" });
+	// Lower priority so the cleanup never starves the UI.
+	try { if (proc.pid) os.setPriority(proc.pid, 10); } catch {}
 	if (!exitHookInstalled) {
 		exitHookInstalled = true;
-		process.once("exit", () => { try { server?.proc.kill("SIGKILL"); } catch {} });
+		G.__piListenCleanupExitHook = true;
+		process.once("exit", () => { try { G.__piListenCleanupServer?.proc.kill("SIGKILL"); } catch {} });
 	}
 	const ready = (async () => {
 		const deadline = Date.now() + 60_000;
@@ -81,9 +91,9 @@ export async function ensureCleanupServer(modelPath: string): Promise<number> {
 		}
 		throw new Error("llama-server did not start within 60s");
 	})();
-	proc.once("error", () => { if (server?.proc === proc) server = null; });
-	proc.once("exit", () => { if (server?.proc === proc) server = null; });
-	server = { proc, port, model: modelPath, ready };
+	proc.once("error", () => { if (server?.proc === proc) setServer(null); });
+	proc.once("exit", () => { if (server?.proc === proc) setServer(null); });
+	setServer({ proc, port, model: modelPath, ready });
 	ready.catch(() => stopCleanupServer());
 	await ready;
 	return port;
@@ -92,7 +102,7 @@ export async function ensureCleanupServer(modelPath: string): Promise<number> {
 export function stopCleanupServer(): void {
 	if (!server) return;
 	try { server.proc.kill("SIGTERM"); } catch {}
-	server = null;
+	setServer(null);
 }
 
 /**

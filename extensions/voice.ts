@@ -1320,8 +1320,13 @@ export default function (pi: ExtensionAPI) {
 		let shown = rawText;
 		const modelPath = resolveCleanupModelPath(config.cleanupModel);
 		ctx?.ui.setStatus("voice", "CLEANUP...");
+		// Repaint the editor at most every 80ms; one repaint per token made the terminal stutter.
+		let lastPaint = 0;
 		cleanupTranscript(raw, modelPath, (soFar) => {
 			if (ac.signal.aborted || !ctx?.hasUI) return;
+			const now = Date.now();
+			if (now - lastPaint < 80) return;
+			lastPaint = now;
 			if ((ctx.ui.getEditorText() || "") !== shown) { voiceDebug("cleanup: editor changed → abort"); ac.abort(); return; }
 			shown = prefix + soFar;
 			ctx.ui.setEditorText(shown);
@@ -1353,9 +1358,6 @@ export default function (pi: ExtensionAPI) {
 	async function startStreamingRecording(): Promise<boolean> {
 		voiceDebug("startStreamingRecording called", { hasKey: !!resolveDeepgramApiKey(config), hasPreRecording: !!preRecordingSession });
 		cancelCleanup();
-		if (config.cleanupEnabled === true) {
-			ensureCleanupServer(resolveCleanupModelPath(config.cleanupModel)).catch((err) => voiceDebug("cleanup prewarm failed", { error: String(err) }));
-		}
 		setVoiceState("recording");
 
 		// ── Callbacks for the active recording session ──
@@ -2291,6 +2293,11 @@ export default function (pi: ExtensionAPI) {
 		const loaded = loadConfigWithSource(startCtx.cwd);
 		config = loaded.config;
 		setMicrophone(config.microphone);
+		// Load the cleanup model in the background at session start, so it
+		// never loads (and competes for the GPU) while you are speaking.
+		if (config.cleanupEnabled === true) {
+			setTimeout(() => ensureCleanupServer(resolveCleanupModelPath(config.cleanupModel)).catch((err) => voiceDebug("cleanup prewarm failed", { error: String(err) })), 2000);
+		}
 		// New sessions start with voice off unless startEnabled is set.
 		// Resume, fork and reload keep whatever /voice last chose.
 		config.enabled = (reason === "startup" || reason === "new")
