@@ -71,6 +71,7 @@ async function sharedServerPort(modelPath: string): Promise<number | null> {
 }
 
 export async function ensureCleanupServer(modelPath: string): Promise<number> {
+	touchIdleTimer();
 	if (server && server.model === modelPath && server.proc.exitCode === null) {
 		await server.ready;
 		return server.port;
@@ -115,9 +116,19 @@ export async function ensureCleanupServer(modelPath: string): Promise<number> {
 	return port;
 }
 
+const IDLE_UNLOAD_MS = 10 * 60_000;
+let idleTimer: ReturnType<typeof setTimeout> | null = null;
+/** Unload the model after 10 idle minutes so it does not hold memory all day. */
+function touchIdleTimer() {
+	if (idleTimer) clearTimeout(idleTimer);
+	idleTimer = setTimeout(() => { idleTimer = null; stopCleanupServer(); }, IDLE_UNLOAD_MS);
+	idleTimer.unref?.();
+}
+
 export function stopCleanupServer(): void {
 	if (!server) return;
 	try { server.proc.kill("SIGTERM"); } catch {}
+	try { fs.unlinkSync(SHARED_FILE); } catch {}
 	setServer(null);
 }
 

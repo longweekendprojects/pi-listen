@@ -1355,6 +1355,15 @@ export default function (pi: ExtensionAPI) {
 	}
 	let lastCleanup: { raw: string; cleaned: string } | null = null;
 
+	/** Load the cleanup model in the background, only while voice is on. */
+	function prewarmCleanup() {
+		if (config.cleanupEnabled !== true) return;
+		setTimeout(() => {
+			if (!config.enabled) return;
+			ensureCleanupServer(resolveCleanupModelPath(config.cleanupModel)).catch((err) => voiceDebug("cleanup prewarm failed", { error: String(err) }));
+		}, 500);
+	}
+
 	async function startStreamingRecording(): Promise<boolean> {
 		voiceDebug("startStreamingRecording called", { hasKey: !!resolveDeepgramApiKey(config), hasPreRecording: !!preRecordingSession });
 		cancelCleanup();
@@ -2293,16 +2302,12 @@ export default function (pi: ExtensionAPI) {
 		const loaded = loadConfigWithSource(startCtx.cwd);
 		config = loaded.config;
 		setMicrophone(config.microphone);
-		// Load the cleanup model in the background at session start, so it
-		// never loads (and competes for the GPU) while you are speaking.
-		if (config.cleanupEnabled === true) {
-			setTimeout(() => ensureCleanupServer(resolveCleanupModelPath(config.cleanupModel)).catch((err) => voiceDebug("cleanup prewarm failed", { error: String(err) })), 2000);
-		}
 		// New sessions start with voice off unless startEnabled is set.
 		// Resume, fork and reload keep whatever /voice last chose.
 		config.enabled = (reason === "startup" || reason === "new")
 			? config.startEnabled === true
 			: wasEnabled;
+		if (config.enabled) prewarmCleanup();
 		configSource = loaded.source;
 
 		// v7.1.3 — version banner emitted to debug log on every session
@@ -2652,6 +2657,7 @@ export default function (pi: ExtensionAPI) {
 				config.enabled = true;
 				updateVoiceStatus();
 				setupHoldToTalk();
+				prewarmCleanup();
 				const backendInfo = config.backend === "local"
 					? `Voice enabled (local model: ${config.localModel || "whisper-small"}).`
 					: "Voice enabled (Deepgram streaming).";
@@ -2675,6 +2681,8 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "off") {
 				config.enabled = false;
 				voiceCleanup();
+				cancelCleanup();
+				stopCleanupServer();
 				ctx.ui.setStatus("voice", undefined);
 				cmdCtx.ui.notify("Voice disabled.", "info");
 				return;
@@ -2936,8 +2944,8 @@ export default function (pi: ExtensionAPI) {
 
 			// Default: toggle
 			config.enabled = !config.enabled;
-			if (!config.enabled) { voiceCleanup(); }
-			else { setupHoldToTalk(); }
+			if (!config.enabled) { voiceCleanup(); cancelCleanup(); stopCleanupServer(); }
+			else { setupHoldToTalk(); prewarmCleanup(); }
 			updateVoiceStatus();
 			cmdCtx.ui.notify(`Voice ${config.enabled ? "enabled" : "disabled"}.`, "info");
 		},
