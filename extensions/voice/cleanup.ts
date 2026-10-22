@@ -57,11 +57,26 @@ function freePort(): Promise<number> {
 }
 
 /** Start llama-server for the model if it is not running. Resolves when it is ready. */
+const SHARED_FILE = path.join(CLEANUP_MODEL_DIR, "server.json");
+
+/** Reuse a server another Pi session already started, so sessions share one model in memory. */
+async function sharedServerPort(modelPath: string): Promise<number | null> {
+	try {
+		const info = JSON.parse(fs.readFileSync(SHARED_FILE, "utf8"));
+		if (info.model !== modelPath) return null;
+		process.kill(info.pid, 0);
+		const r = await fetch(`http://127.0.0.1:${info.port}/health`);
+		return r.ok ? info.port : null;
+	} catch { return null; }
+}
+
 export async function ensureCleanupServer(modelPath: string): Promise<number> {
 	if (server && server.model === modelPath && server.proc.exitCode === null) {
 		await server.ready;
 		return server.port;
 	}
+	const shared = await sharedServerPort(modelPath);
+	if (shared) return shared;
 	stopCleanupServer();
 	if (!fs.existsSync(modelPath)) throw new Error(`Cleanup model not found: ${modelPath}`);
 	const port = await freePort();
@@ -94,6 +109,7 @@ export async function ensureCleanupServer(modelPath: string): Promise<number> {
 	proc.once("error", () => { if (server?.proc === proc) setServer(null); });
 	proc.once("exit", () => { if (server?.proc === proc) setServer(null); });
 	setServer({ proc, port, model: modelPath, ready });
+	ready.then(() => { try { fs.writeFileSync(SHARED_FILE, JSON.stringify({ pid: proc.pid, port, model: modelPath })); } catch {} }, () => {});
 	ready.catch(() => stopCleanupServer());
 	await ready;
 	return port;
