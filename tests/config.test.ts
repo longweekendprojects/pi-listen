@@ -281,6 +281,29 @@ describe("saveConfig", () => {
 		expect(tmpFiles).toHaveLength(0);
 		expect(JSON.parse(fs.readFileSync(savedPath, "utf8"))).toBeDefined();
 	});
+
+	test("keeps a symlinked settings.json linked and writes to its target", () => {
+		const cwd = makeTempDir();
+		const agentDir = path.join(cwd, "agent-home");
+		const targetPath = path.join(cwd, "dotfiles", "settings.json");
+		fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+		fs.writeFileSync(targetPath, JSON.stringify({ theme: "dark" }));
+		fs.mkdirSync(agentDir, { recursive: true });
+		const linkPath = path.join(agentDir, "settings.json");
+		fs.symlinkSync(targetPath, linkPath);
+		const config: VoiceConfig = {
+			...DEFAULT_CONFIG,
+			scope: "global",
+			onboarding: { completed: true, schemaVersion: DEFAULT_CONFIG.version },
+		};
+
+		saveConfig(config, "global", cwd, { agentDir });
+		const saved = JSON.parse(fs.readFileSync(targetPath, "utf8"));
+
+		expect(fs.lstatSync(linkPath).isSymbolicLink()).toBe(true);
+		expect(saved.theme).toBe("dark");
+		expect(saved.voice.scope).toBe("global");
+	});
 });
 
 describe("isLoopbackEndpoint", () => {

@@ -22,7 +22,7 @@ import { SAMPLE_RATE, CHANNELS } from "./deepgram";
 
 export interface SherpaModelConfig {
 	/** Recognizer type for sherpa-onnx */
-	type: "whisper" | "moonshine" | "sense_voice" | "nemo_ctc" | "transducer";
+	type: "whisper" | "moonshine" | "sense_voice" | "nemo_ctc" | "transducer" | "online_transducer";
 	/** Map of role → filename within model directory */
 	files: Record<string, string>;
 	/** Map of role → download URL (HuggingFace or GitHub releases) */
@@ -89,6 +89,48 @@ export const LOCAL_MODELS: LocalModelInfo[] = [
 	// ═══════════════════════════════════════════════════════════════════════
 	// TOP PICKS — best overall models, shown first
 	// ═══════════════════════════════════════════════════════════════════════
+	{
+		id: "nemotron-3.5-streaming", name: "Nemotron 3.5 ASR Streaming", size: "~682 MB", sizeBytes: 682215356, runtimeRamMB: 1700,
+		notes: "NVIDIA 2026 multilingual streaming model, text appears while you speak", langSupport: "parakeet-multi", tier: "standard", preferred: true, accuracy: 5, speed: 5,
+		sherpaModel: {
+			type: "online_transducer",
+			files: { encoder: "encoder.int8.onnx", decoder: "decoder.int8.onnx", joiner: "joiner.int8.onnx", tokens: "tokens.txt" },
+			downloadUrls: {
+				encoder: hf2("sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11", "encoder.int8.onnx"),
+				decoder: hf2("sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11", "decoder.int8.onnx"),
+				joiner: hf2("sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11", "joiner.int8.onnx"),
+				tokens: hf2("sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11", "tokens.txt"),
+			},
+		},
+	},
+	{
+		id: "parakeet-unified-streaming", name: "Parakeet Unified EN Streaming", size: "~663 MB", sizeBytes: 663040542, runtimeRamMB: 1650,
+		notes: "NVIDIA 2026 Parakeet, English, text appears while you speak", langSupport: "english-only", tier: "standard", preferred: true, accuracy: 5, speed: 5,
+		sherpaModel: {
+			type: "online_transducer",
+			files: { encoder: "encoder.int8.onnx", decoder: "decoder.int8.onnx", joiner: "joiner.int8.onnx", tokens: "tokens.txt" },
+			downloadUrls: {
+				encoder: hf2("sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-560ms", "encoder.int8.onnx"),
+				decoder: hf2("sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-560ms", "decoder.int8.onnx"),
+				joiner: hf2("sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-560ms", "joiner.int8.onnx"),
+				tokens: hf2("sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-560ms", "tokens.txt"),
+			},
+		},
+	},
+	{
+		id: "parakeet-unified", name: "Parakeet Unified EN", size: "~663 MB", sizeBytes: 663043117, runtimeRamMB: 1650,
+		notes: "NVIDIA 2026 Parakeet, English, transcribes after you stop", langSupport: "english-only", tier: "standard", preferred: true, accuracy: 5, speed: 4,
+		sherpaModel: {
+			type: "transducer",
+			files: { encoder: "encoder.int8.onnx", decoder: "decoder.int8.onnx", joiner: "joiner.int8.onnx", tokens: "tokens.txt" },
+			downloadUrls: {
+				encoder: hf2("sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming", "encoder.int8.onnx"),
+				decoder: hf2("sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming", "decoder.int8.onnx"),
+				joiner: hf2("sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming", "joiner.int8.onnx"),
+				tokens: hf2("sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming", "tokens.txt"),
+			},
+		},
+	},
 	{
 		id: "parakeet-v3", name: "Parakeet TDT v3", size: "~671 MB", sizeBytes: 703_594_496, runtimeRamMB: 1675,
 		notes: "Best multilingual — 25 languages, auto language detection, WER 6.3%", langSupport: "parakeet-multi", tier: "standard", preferred: true, accuracy: 4, speed: 4,
@@ -355,7 +397,7 @@ export const LOCAL_MODELS: LocalModelInfo[] = [
 ];
 
 export const DEFAULT_LOCAL_ENDPOINT = "http://localhost:8080";
-export const DEFAULT_LOCAL_MODEL = "parakeet-v3";
+export const DEFAULT_LOCAL_MODEL = "nemotron-3.5-streaming";
 
 // ─── Language support per model family ───────────────────────────────────────
 // Whisper uses simple ISO 639-1 codes (no regional variants like "en-AU").
@@ -515,6 +557,8 @@ export interface LocalSession {
 	audioChunks: Buffer[];
 	closed: boolean;
 	hadAudioData: boolean;
+	/** Live decoder for streaming models; null for record-then-transcribe models. */
+	live: LiveDecoder | null;
 	onTranscript: (interim: string, finals: string[]) => void;
 	onDone: (fullText: string, meta: { hadAudio: boolean; hadSpeech: boolean }) => void;
 	onError: (err: string) => void;
@@ -666,6 +710,7 @@ export function startLocalSession(
 		onDone: (fullText: string, meta: { hadAudio: boolean; hadSpeech: boolean }) => void;
 		onError: (err: string) => void;
 	},
+	config?: VoiceConfig,
 ): LocalSession {
 	const session: LocalSession = {
 		backend: "local",
@@ -673,15 +718,26 @@ export function startLocalSession(
 		audioChunks: [],
 		closed: false,
 		hadAudioData: false,
+		live: null,
 		onTranscript: callbacks.onTranscript,
 		onDone: callbacks.onDone,
 		onError: callbacks.onError,
 	};
 
+	const model = config && !config.localEndpoint ? findLocalModel(config) : undefined;
+	if (config && model?.sherpaModel.type === "online_transducer") {
+		session.live = new LiveDecoder(model, config.language || "en", (interim, finals) => {
+			if (!session.closed) session.onTranscript(interim, finals);
+		}, (err) => {
+			if (!session.closed) { session.closed = true; try { recProcess.kill("SIGTERM"); } catch {} session.onError(err); }
+		});
+	}
+
 	recProcess.stdout?.on("data", (chunk: Buffer) => {
 		if (!session.closed) {
 			session.hadAudioData = true;
-			session.audioChunks.push(chunk);
+			if (session.live) session.live.push(chunk);
+			else session.audioChunks.push(chunk);
 		}
 	});
 
@@ -719,6 +775,20 @@ export async function stopLocalSession(session: LocalSession, config: VoiceConfi
 	// Still call onDone so the voice state machine transitions back to idle.
 	if (session.closed) {
 		session.onDone("", { hadAudio: false, hadSpeech: false });
+		return;
+	}
+
+	if (session.live) {
+		try {
+			const text = await session.live.finish();
+			if (session.closed) { session.onDone("", { hadAudio: false, hadSpeech: false }); return; }
+			session.closed = true;
+			session.onDone(text, { hadAudio: session.hadAudioData, hadSpeech: text.length > 0 });
+		} catch (err: any) {
+			const wasClosed = session.closed;
+			session.closed = true;
+			session.onError(`Local transcription ${wasClosed ? "aborted" : "failed"}: ${err?.message || err}`);
+		}
 		return;
 	}
 
@@ -777,7 +847,70 @@ export async function stopLocalSession(session: LocalSession, config: VoiceConfi
 export function abortLocalSession(session: LocalSession | null): void {
 	if (!session || session.closed) return;
 	session.closed = true;
+	session.live?.abort();
 	try { session.recProcess.kill("SIGKILL"); } catch {}
+}
+
+function findLocalModel(config: VoiceConfig): LocalModelInfo | undefined {
+	return LOCAL_MODELS.find(m => m.id === (config.localModel || DEFAULT_LOCAL_MODEL));
+}
+
+/** Load sherpa and the model files, downloading them on first use. */
+async function prepareModel(model: LocalModelInfo): Promise<string> {
+	const { initSherpa, isSherpaAvailable, getSherpaError } = await import("./sherpa-engine");
+	const { ensureModelDownloaded } = await import("./model-download");
+	if (!isSherpaAvailable() && !(await initSherpa())) {
+		throw new Error(`sherpa-onnx not available: ${getSherpaError() || "unknown error"}. Set localEndpoint in config to use an external server instead.`);
+	}
+	return ensureModelDownloaded(model.id, model.sherpaModel.downloadUrls, model.sizeBytes);
+}
+
+/**
+ * Feeds microphone audio to a streaming sherpa model as it arrives and
+ * reports partial text. Audio captured while the model loads is queued.
+ */
+export class LiveDecoder {
+	private queue: Buffer[] = [];
+	private decoder: import("./sherpa-engine").StreamingDecoder | null = null;
+	private ready: Promise<void>;
+	private aborted = false;
+
+	constructor(
+		model: LocalModelInfo,
+		language: string,
+		private onUpdate: (interim: string, finals: string[]) => void,
+		onError: (err: string) => void,
+	) {
+		this.ready = (async () => {
+			const modelDir = await prepareModel(model);
+			const { createStreamingDecoder } = await import("./sherpa-engine");
+			if (this.aborted) return;
+			this.decoder = createStreamingDecoder(model, modelDir, language);
+			for (const chunk of this.queue.splice(0)) this.feed(chunk);
+		})();
+		this.ready.catch((err) => onError(`Local model failed to load: ${err?.message || err}`));
+	}
+
+	push(chunk: Buffer): void {
+		if (this.decoder) this.feed(chunk);
+		else this.queue.push(chunk);
+	}
+
+	private feed(chunk: Buffer): void {
+		const update = this.decoder!.accept(chunk);
+		if (update) this.onUpdate(update.interim, update.finals);
+	}
+
+	async finish(): Promise<string> {
+		await this.ready;
+		if (!this.decoder) return "";
+		return this.decoder.finish();
+	}
+
+	abort(): void {
+		this.aborted = true;
+		this.queue.length = 0;
+	}
 }
 
 // ─── In-process transcription via sherpa-onnx ────────────────────────────────
@@ -787,26 +920,10 @@ export function abortLocalSession(session: LocalSession | null): void {
  * Auto-downloads model on first use.
  */
 async function transcribeInProcess(pcmData: Buffer, config: VoiceConfig): Promise<string> {
-	const { initSherpa, isSherpaAvailable, getSherpaError, getOrCreateRecognizer, transcribeBuffer } = await import("./sherpa-engine");
-	const { ensureModelDownloaded } = await import("./model-download");
-
-	// Initialize sherpa if needed
-	if (!isSherpaAvailable()) {
-		const ok = await initSherpa();
-		if (!ok) {
-			throw new Error(`sherpa-onnx not available: ${getSherpaError() || "unknown error"}. Set localEndpoint in config to use an external server instead.`);
-		}
-	}
-
-	const model = LOCAL_MODELS.find(m => m.id === (config.localModel || DEFAULT_LOCAL_MODEL));
+	const { getOrCreateRecognizer, transcribeBuffer } = await import("./sherpa-engine");
+	const model = findLocalModel(config);
 	if (!model) throw new Error(`Unknown model: ${config.localModel}`);
-
-	// Ensure model files are downloaded
-	const modelDir = await ensureModelDownloaded(
-		model.id,
-		model.sherpaModel.downloadUrls,
-		model.sizeBytes,
-	);
+	const modelDir = await prepareModel(model);
 
 	// Create/reuse recognizer and transcribe
 	const recognizer = getOrCreateRecognizer(model, modelDir, config.language || "en");

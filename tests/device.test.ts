@@ -242,7 +242,7 @@ describe("LOCAL_MODELS catalog", () => {
 	test("Parakeet models use transducer type (not nemo_ctc)", () => {
 		const parakeetModels = LOCAL_MODELS.filter(m => m.id.startsWith("parakeet"));
 		for (const model of parakeetModels) {
-			expect(model.sherpaModel.type).toBe("transducer");
+			expect(["transducer", "online_transducer"]).toContain(model.sherpaModel.type);
 			expect(model.sherpaModel.files.encoder).toBeDefined();
 			expect(model.sherpaModel.files.decoder).toBeDefined();
 			expect(model.sherpaModel.files.joiner).toBeDefined();

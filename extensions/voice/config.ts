@@ -26,6 +26,8 @@ export type VoiceBackend = "deepgram" | "local";
 export interface VoiceConfig {
 	version: number;
 	enabled: boolean;
+	/** Turn voice on when a new session starts. Default false: sessions start with voice off. */
+	startEnabled?: boolean;
 	language: string;
 	scope: VoiceSettingsScope;
 	onboarding: VoiceOnboardingState;
@@ -39,6 +41,12 @@ export interface VoiceConfig {
 	localEndpoint?: string;
 	/** Global-only shortcut used to toggle recording without hold-to-talk */
 	toggleShortcut?: string;
+	/** Input device name; unset means the system default microphone. */
+	microphone?: string;
+	/** Rewrite each transcript with a local LLM after recording. Default false. */
+	cleanupEnabled?: boolean;
+	/** Path to a GGUF model for cleanup; unset means the default Qwen3.5 4B. */
+	cleanupModel?: string;
 
 	// ─── TTS (text-to-speech) ─────────────────────────────────────────
 	// All TTS fields are opt-in (default: TTS disabled). New in v6.0.0.
@@ -188,6 +196,7 @@ function migrateConfig(rawVoice: any, source: VoiceConfigSource): VoiceConfig {
 	return {
 		version: VOICE_CONFIG_VERSION,
 		enabled: typeof rawVoice.enabled === "boolean" ? rawVoice.enabled : DEFAULT_CONFIG.enabled,
+		startEnabled: rawVoice.startEnabled === true,
 		language: typeof rawVoice.language === "string" ? rawVoice.language : DEFAULT_CONFIG.language,
 		scope: (rawVoice.scope as VoiceSettingsScope | undefined) ?? (source === "project" ? "project" : "global"),
 		deepgramApiKey: typeof rawVoice.deepgramApiKey === "string" ? rawVoice.deepgramApiKey : undefined,
@@ -220,6 +229,9 @@ function migrateConfig(rawVoice: any, source: VoiceConfigSource): VoiceConfig {
 		autoSubmitOnSpeak: typeof rawVoice.autoSubmitOnSpeak === "boolean"
 			? rawVoice.autoSubmitOnSpeak
 			: DEFAULT_CONFIG.autoSubmitOnSpeak,
+		cleanupEnabled: rawVoice.cleanupEnabled === true,
+		cleanupModel: typeof rawVoice.cleanupModel === "string" && rawVoice.cleanupModel ? rawVoice.cleanupModel : undefined,
+		microphone: typeof rawVoice.microphone === "string" && rawVoice.microphone ? rawVoice.microphone : undefined,
 		holdThresholdMs: typeof rawVoice.holdThresholdMs === "number"
 			&& Number.isFinite(rawVoice.holdThresholdMs)
 			&& rawVoice.holdThresholdMs >= 200
@@ -364,12 +376,15 @@ export function saveConfig(
 	const settingsPath = scope === "project" ? getProjectSettingsPath(cwd) : getGlobalSettingsPath(options);
 	const settings = readJsonFile(settingsPath);
 	settings[SETTINGS_KEY] = serializeConfig(config, scope);
-	fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+	// Write to the file a symlinked settings.json points at, so the rename keeps the link.
+	let targetPath = settingsPath;
+	try { targetPath = fs.realpathSync(settingsPath); } catch {}
+	fs.mkdirSync(path.dirname(targetPath), { recursive: true });
 	// Atomic write: temp file + rename prevents corruption from partial writes
-	const tmpPath = `${settingsPath}.${process.pid}.tmp`;
+	const tmpPath = `${targetPath}.${process.pid}.tmp`;
 	try {
 		fs.writeFileSync(tmpPath, JSON.stringify(settings, null, 2) + "\n");
-		fs.renameSync(tmpPath, settingsPath);
+		fs.renameSync(tmpPath, targetPath);
 	} finally {
 		try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch {}
 	}

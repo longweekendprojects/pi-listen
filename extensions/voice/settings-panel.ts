@@ -21,7 +21,7 @@
 import { matchesKey, Key, truncateToWidth } from "@mariozechner/pi-tui";
 import type { Theme, ThemeColor } from "@mariozechner/pi-coding-agent";
 import type { VoiceConfig, VoiceSettingsScope } from "./config";
-import { LOCAL_MODELS, getLanguagesForLocalModel, type LocalModelInfo } from "./local";
+import { LOCAL_MODELS, DEFAULT_LOCAL_MODEL, getLanguagesForLocalModel, type LocalModelInfo } from "./local";
 import type { DeviceProfile, ModelFitness } from "./device";
 import { getFreeDiskSpace, formatBytes, getModelsDir, scanHandyModels, importHandyModel } from "./model-download";
 import {
@@ -479,7 +479,7 @@ export class VoiceSettingsPanel {
 
 	private renderModels(_w: number, iw: number): string[] {
 		const lines: string[] = [];
-		const currentId = this.p.config.localModel || "parakeet-v3";
+		const currentId = this.p.config.localModel || DEFAULT_LOCAL_MODEL;
 		const downloadedMap = new Map(this.p.getDownloadedModels().map(d => [d.id, d.sizeMB]));
 
 		// Search bar
@@ -576,7 +576,7 @@ export class VoiceSettingsPanel {
 	private renderDownloaded(_w: number, _iw: number): string[] {
 		const lines: string[] = [];
 		const dl = this.getDownloaded();
-		const currentId = this.p.config.localModel || "parakeet-v3";
+		const currentId = this.p.config.localModel || DEFAULT_LOCAL_MODEL;
 		const handy = scanHandyModels();
 		const handyNotImported = handy.filter(h => !h.imported);
 
@@ -1438,7 +1438,7 @@ export class VoiceSettingsPanel {
 	}
 
 	private getDownloaded(): { id: string; name: string; sizeMB: number; isCurrent: boolean }[] {
-		const currentId = this.p.config.localModel || "parakeet-v3";
+		const currentId = this.p.config.localModel || DEFAULT_LOCAL_MODEL;
 		return this.p.getDownloadedModels().map(d => ({
 			...d,
 			name: LOCAL_MODELS.find(m => m.id === d.id)?.name || d.id,
@@ -1516,11 +1516,12 @@ function groupModels(rows: ModelRow[]): ModelGroup[] {
 	const byFamily = (predicate: (r: ModelRow) => boolean) => rows.filter(predicate);
 
 	const topPicks = rows.filter(r => r.fitness === "recommended").slice(0, 4);
-	const parakeet = byFamily(r => r.id.startsWith("parakeet-"));
+	const parakeet = byFamily(r => r.id.startsWith("parakeet-") || r.id.startsWith("nemotron-"));
 	const whisper = byFamily(r => r.id.startsWith("whisper-"));
 	const moonshine = byFamily(r => r.id.startsWith("moonshine-"));
 	const specialist = byFamily(r =>
 		!r.id.startsWith("parakeet-") &&
+		!r.id.startsWith("nemotron-") &&
 		!r.id.startsWith("whisper-") &&
 		!r.id.startsWith("moonshine-"),
 	);
@@ -1535,8 +1536,8 @@ function groupModels(rows: ModelRow[]): ModelGroup[] {
 	}
 	if (parakeet.length > 0) {
 		groups.push({
-			heading: "Parakeet (multilingual)",
-			subtitle: "NVIDIA NeMo · TDT",
+			heading: "NVIDIA Nemotron & Parakeet",
+			subtitle: "NeMo · streaming and TDT",
 			rows: parakeet,
 		});
 	}
