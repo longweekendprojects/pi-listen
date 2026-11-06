@@ -376,12 +376,15 @@ export function saveConfig(
 	const settingsPath = scope === "project" ? getProjectSettingsPath(cwd) : getGlobalSettingsPath(options);
 	const settings = readJsonFile(settingsPath);
 	settings[SETTINGS_KEY] = serializeConfig(config, scope);
-	fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+	// Write to the file a symlinked settings.json points at, so the rename keeps the link.
+	let targetPath = settingsPath;
+	try { targetPath = fs.realpathSync(settingsPath); } catch {}
+	fs.mkdirSync(path.dirname(targetPath), { recursive: true });
 	// Atomic write: temp file + rename prevents corruption from partial writes
-	const tmpPath = `${settingsPath}.${process.pid}.tmp`;
+	const tmpPath = `${targetPath}.${process.pid}.tmp`;
 	try {
 		fs.writeFileSync(tmpPath, JSON.stringify(settings, null, 2) + "\n");
-		fs.renameSync(tmpPath, settingsPath);
+		fs.renameSync(tmpPath, targetPath);
 	} finally {
 		try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch {}
 	}
